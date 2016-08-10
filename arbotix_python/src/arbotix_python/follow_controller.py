@@ -36,6 +36,9 @@ from diagnostic_msgs.msg import *
 from ax12 import *
 from controllers import *
 
+SLAVE_SUFFIX = "_slave"
+
+
 class FollowController(Controller):
     """ A controller for joint chains, exposing a FollowJointTrajectory action. """
 
@@ -47,8 +50,15 @@ class FollowController(Controller):
         self.rate = rospy.get_param('~controllers/'+name+'/rate',50.0)
         self.joints = rospy.get_param('~controllers/'+name+'/joints')
         self.index = rospy.get_param('~controllers/'+name+'/index', len(device.controllers))
+
+        self.servos = []
         for joint in self.joints:
             self.device.joints[joint].controller = self
+            self.servos.append(joint)
+            slave_joint = self._findSlaveJoint(joint)
+            if slave_joint is not None:
+                slave_joint.controller = self
+                self.servos.append(slave_joint.name)
 
         # action server
         name = rospy.get_param('~controllers/'+name+'/action_name','follow_joint_trajectory')
@@ -59,6 +69,12 @@ class FollowController(Controller):
         self.executing = False
 
         rospy.loginfo("Started FollowController ("+self.name+"). Joints: " + str(self.joints) + " on C" + str(self.index))
+
+    def _findSlaveJoint(self, name):
+        for joint in self.device.joints.keys():
+            if joint == name + SLAVE_SUFFIX:
+                return self.device.joints[joint]
+        return None
 
     def startup(self):
         self.server.start()
@@ -111,7 +127,7 @@ class FollowController(Controller):
         rospy.logdebug(traj)
         # carry out trajectory
         try:
-            indexes = [traj.joint_names.index(joint) for joint in self.joints]
+            indexes = self.getJointIndiciesForServos(traj.joint_names, self.servos)
         except ValueError as val:
             rospy.logerr("Invalid joint in trajectory.")
             return False
@@ -122,7 +138,7 @@ class FollowController(Controller):
             start = rospy.Time.now()
 
         r = rospy.Rate(self.rate)
-        last = [ self.device.joints[joint].position for joint in self.joints ]
+        last = [ self.device.joints[joint].position for joint in self.servos]
         for point in traj.points:
             while rospy.Time.now() + rospy.Duration(0.01) < start:
                 rospy.sleep(0.01)
@@ -132,7 +148,7 @@ class FollowController(Controller):
                 err = [ (d-c) for d,c in zip(desired,last) ]
                 velocity = [ abs(x / (self.rate * (endtime - rospy.Time.now()).to_sec())) for x in err ]
                 rospy.logdebug(err)
-                for i in range(len(self.joints)):
+                for i in range(len(self.servos)):
                     if err[i] > 0.001 or err[i] < -0.001:
                         cmd = err[i] 
                         top = velocity[i]
@@ -141,11 +157,22 @@ class FollowController(Controller):
                         elif cmd < -top:
                             cmd = -top
                         last[i] += cmd
-                        self.device.joints[self.joints[i]].setControlOutput(last[i])
+                        self.device.joints[self.servos[i]].setControlOutput(last[i])
                     else:
                         velocity[i] = 0
                 r.sleep()
         return True
+
+    @staticmethod
+    def getJointIndiciesForServos(joint_names, servos):
+        indices = []
+        for servo in servos:
+            if servo.endswith(SLAVE_SUFFIX):
+                i = joint_names.index(servo[0:-len(SLAVE_SUFFIX)])
+            else:
+                i = joint_names.index(servo)
+            indices.append(i)
+        return indices
 
     def active(self):
         """ Is controller overriding servo internal control? """
