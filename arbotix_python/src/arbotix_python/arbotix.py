@@ -32,12 +32,16 @@
 
 import serial, time, sys, thread
 from ax12 import *
-from struct import unpack
+from struct import pack, unpack
+
+## @brief ArbotiX errors. Used by now to handle broken serial connections.
+class ArbotiXException(Exception):
+    pass
 
 ## @brief This class controls an ArbotiX, USBDynamixel, or similar board through a serial connection.
 class ArbotiX:
 
-    ## @brief Constructs an ArbotiX instance and opens the serial connection.
+    ## @brief Constructs an ArbotiX instance, optionally opening the serial connection.
     ##
     ## @param port The name of the serial port to open.
     ## 
@@ -45,17 +49,38 @@ class ArbotiX:
     ##
     ## @param timeout The timeout to use for the port. When operating over a wireless link, you may need to
     ## increase this.
-    def __init__(self, port="/dev/ttyUSB0",baud=115200, timeout = 0.1):
+    ##
+    ## @param open Whether to open immediately the serial port.
+    def __init__(self, port="/dev/ttyUSB0", baud=115200, timeout=0.1, open_port=True):
         self._mutex = thread.allocate_lock()
         self._ser = serial.Serial()
         
-        self._ser.baudrate = baud
         self._ser.port = port
+        self._ser.baudrate = baud
         self._ser.timeout = timeout
-        self._ser.open()
+
+        if open_port:
+            self._ser.open()
 
         ## The last error level read back
         self.error = 0
+
+    def __write__(self, msg):
+        try:
+            self._ser.write(msg)
+        except serial.SerialException as e:
+            self._mutex.release()
+            raise ArbotiXException(e)
+
+    def openPort(self):
+        self._ser.close()
+        try:
+            self._ser.open()
+        except serial.SerialException as e:
+            raise ArbotiXException(e)
+
+    def closePort(self):
+        self._ser.close()
 
     ## @brief Read a dynamixel return packet in an iterative attempt.
     ##
@@ -64,7 +89,7 @@ class ArbotiX:
     ## @return The error level returned by the device. 
     def getPacket(self, mode, id=-1, leng=-1, error=-1, params = None):
         try:
-            d = self._ser.read()     
+            d = self._ser.read(leng - 2 if mode == 5 else 1)     
         except Exception as e:
             print e
             return None
@@ -97,7 +122,7 @@ class ArbotiX:
             else:
                 return self.getPacket(5, id, leng, ord(d), list())
         elif mode == 5:         # read params
-            params.append(ord(d))
+            params += map(ord, d)
             if len(params) + 2 == leng:
                 return self.getPacket(6, id, leng, error, params)
             else:
@@ -130,25 +155,10 @@ class ArbotiX:
             print e
         length = 2 + len(params)
         checksum = 255 - ((index + length + ins + sum(params))%256)
-        try: 
-            self._ser.write(chr(0xFF)+chr(0xFF)+chr(index)+chr(length)+chr(ins))
-        except Exception as e:
-            print e
-            self._mutex.release()
-            return None
+        self.__write__(chr(0xFF)+chr(0xFF)+chr(index)+chr(length)+chr(ins))
         for val in params:
-            try:
-                self._ser.write(chr(val))
-            except Exception as e:
-                print e
-                self._mutex.release()
-                return None
-        try:
-            self._ser.write(chr(checksum))
-        except Exception as e:
-            print e
-            self._mutex.release()
-            return None
+            self.__write__(chr(val))
+        self.__write__(chr(checksum))
         if ret:
             values = self.getPacket(0)
         self._mutex.release()
@@ -200,13 +210,13 @@ class ArbotiX:
             self._ser.flushInput()
         except:
             pass  
-        self._ser.write(chr(0xFF)+chr(0xFF)+chr(254)+chr(length)+chr(AX_SYNC_WRITE))        
-        self._ser.write(chr(start))              # start address
-        self._ser.write(chr(lbytes))             # bytes to write each servo
+        self.__write__(chr(0xFF)+chr(0xFF)+chr(254)+chr(length)+chr(AX_SYNC_WRITE))
+        self.__write__(chr(start))              # start address
+        self.__write__(chr(lbytes))             # bytes to write each servo
         for i in output:
-            self._ser.write(chr(i))
+            self.__write__(chr(i))
         checksum = 255 - ((254 + length + AX_SYNC_WRITE + start + lbytes + sum(output))%256)
-        self._ser.write(chr(checksum))
+        self.__write__(chr(checksum))
         self._mutex.release()
 
     ## @brief Read values of registers on many servos.
@@ -288,6 +298,20 @@ class ArbotiX:
     def setPosition(self, index, value):
         return self.write(index, P_GOAL_POSITION_L, [value%256, value>>8])
 
+    ## @brief Set the position of all servos from ID=1 to ID=len(values).
+    ## We use an ArbotiX (id:253) instruction ARB_WRITE_POSE (50). It is
+    ## experimental, so please ensure that your firmware supports it.
+    ## TODO: would be nicer to provide a list of the servos to write.
+    ##
+    ## @param values The positions to go to in, in servo ticks.
+    ##
+    ## @return The error level.
+    def setPositions(self, values):
+        params = [P_GOAL_POSITION_L, len(values)]
+        for v in values:
+            params += unpack('<BB', pack('<h', v))
+        return self.execute(253, 50, params)
+
     ## @brief Set the speed of a servo.
     ##
     ## @param index The ID of the device to write.
@@ -309,6 +333,51 @@ class ArbotiX:
             return int(values[0]) + (int(values[1])<<8)
         except:
             return -1
+
+    ## @brief Get the position of all servos from ID=1 to ID=servo_count.
+    ## We use an ArbotiX (id:253) instruction ARB_READ_POSE (40). It is
+    ## experimental, so please ensure that your firmware supports it.
+    ## TODO: would be nicer to provide a range or a list of servos to read.
+    ##
+    ## @param servo_count The number of devices to read.
+    ##
+    ## @return The position of the requested servos.
+    def getPositions(self, servo_count):
+        values = self.execute(253, 40, [P_PRESENT_POSITION_L, servo_count])
+        try:
+            return [int(values[i]) + (int(values[i+1])<<8) for i in range(0, servo_count*2, 2)]
+        except:
+            return None
+
+    ## @brief Get the position and effort of all servos from ID=1
+    ## to ID=servo_count. We use an ArbotiX (id:253) instruction ARB_READ_P_E (41).
+    ## It is experimental, so please ensure that your firmware supports it.
+    ## TODO: would be nicer to provide a range or a list of servos to read.
+    ##
+    ## @param servo_count The number of devices to read.
+    ##
+    ## @return The position and effort of the requested servos.
+    def getPosAndEff(self, servo_count):
+        values = self.execute(253, 41, [P_PRESENT_POSITION_L, servo_count])
+        try:
+            return [int(values[i]) + (int(values[i+1])<<8) for i in range(0, servo_count*4, 2)]
+        except:
+            return None
+
+    ## @brief Get the position, velocity and effort of all servos from ID=1
+    ## to ID=servo_count. We use an ArbotiX (id:253) instruction ARB_READ_P_V_E (42).
+    ## It is experimental, so please ensure that your firmware supports it.
+    ## TODO: would be nicer to provide a range or a list of servos to read.
+    ##
+    ## @param servo_count The number of devices to read.
+    ##
+    ## @return The position, velocity and effort of the requested servos.
+    def getPosVelEff(self, servo_count):
+        values = self.execute(253, 42, [P_PRESENT_POSITION_L, servo_count])
+        try:
+            return [int(values[i]) + (int(values[i+1])<<8) for i in range(0, servo_count*6, 2)]
+        except:
+            return None
 
     ## @brief Get the speed of a servo.
     ##

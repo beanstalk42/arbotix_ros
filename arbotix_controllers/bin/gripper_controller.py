@@ -28,12 +28,13 @@
 """
 
 import rospy, actionlib
-import thread
+import collections
+import threading
 
-from control_msgs.msg import GripperCommandAction
+from control_msgs.msg import GripperCommandAction, GripperCommandResult, GripperCommandFeedback
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64
-from math import asin
+from math import sin, asin
 
 class TrapezoidGripperModel:
     """ A simple gripper with two opposing servos to open/close non-parallel jaws. """
@@ -133,11 +134,16 @@ class OneSideGripperModel:
 
     def setCommand(self, command):
         """ Take an input command of width to open gripper. """
-        # check limits
-        if command.position > self.max_opening or command.position < self.min_opening:
-            rospy.logerr("Command (%f) exceeds opening limits (%f, %f)",
-                          command.position, self.max_opening, self.min_opening)
-            return False
+        # check opening limits and bound if necessary
+        if command.position > self.max_opening:
+            rospy.logwarn("Command (%f) exceeds opening limits; we will use max opening instead (%f)",
+                           command.position, self.max_opening)
+            command.position = self.max_opening
+        elif command.position < self.min_opening:
+            rospy.logwarn("Command (%f) exceeds opening limits; we will use min opening instead (%f)",
+                           command.position, self.min_opening)
+            command.position = self.min_opening
+
         # compute angle
         angle = asin((command.position - self.pad_width)/(2*self.finger_length))
         # publish message
@@ -146,9 +152,16 @@ class OneSideGripperModel:
         else:
             self.pub.publish(angle + self.center)
 
-    def getPosition(self, joint_states):
-        # TODO
-        return 0.0
+        return True
+
+    def getPosition(self, joint_angle):
+        # revert angle calculation done in setCommand
+        if self.invert:
+            angle = self.center - joint_angle 
+        else:
+            angle = joint_angle - self.center
+
+        return sin(angle)*2*self.finger_length + self.pad_width
 
     def getEffort(self, joint_states):
         # TODO
@@ -159,6 +172,20 @@ class GripperActionController:
     """ The actual action callbacks. """
     def __init__(self):
         rospy.init_node('gripper_controller')
+
+        # auxiliary constants; make parameters if not generic enough
+        self._EPSILON_OPENING_DIFF_ = 0.001  # one millimeter; close enough to goal position
+        
+        # buffer used to estimate gripper joint state topic frequency 
+        self._STATE_HZ_BUFFER_SIZE_ = 10 
+        
+        self.state_cb_event = threading.Event()
+        self.state_cb_times = collections.deque(maxlen=self._STATE_HZ_BUFFER_SIZE_)
+        
+        # time the controller will wait before deciding that the gripper is stalled
+        # WARN: if too long, and the commanded pose is smaller than the grasped object,
+        # the servo can get jammed (it will stop working ant its led will start blinking)
+        self.stalled_time = rospy.get_param('~stalled_time', 0.2)
 
         # setup model
         try:
@@ -173,7 +200,7 @@ class GripperActionController:
         elif model == 'singlesided':
             self.model = OneSideGripperModel()
         else:
-            rospy.logerr('unknown model specified, exiting')
+            rospy.logerr('Gripper Controller: unknown model specified, exiting')
             exit()
 
         # subscribe to joint_states
@@ -185,23 +212,86 @@ class GripperActionController:
         rospy.spin()
 
     def actionCb(self, goal):
+        result = GripperCommandResult()
+        feedback = GripperCommandFeedback()
+        
         """ Take an input command of width to open gripper. """
-        rospy.loginfo('Gripper controller action goal recieved:%f' % goal.command.position)
+        rospy.loginfo('Gripper Controller action goal received: %f' % goal.command.position)
+        
         # send command to gripper
-        self.model.setCommand(goal.command)
-        # publish feedback
+        if not self.model.setCommand(goal.command):
+            self.server.set_aborted()
+            rospy.loginfo('Gripper Controller: Aborted.')
+            return
+        
+        # register progress so we can guess if the gripper is stalled; our buffer 
+        # must contain up to: stalled_time / joint_states period position values
+        if len(self.state_cb_times) == self.state_cb_times.maxlen:
+            T = sum(self.state_cb_times[i] - self.state_cb_times[i-1] \
+                    for i in xrange(1, len(self.state_cb_times) - 1)) \
+                 /(len(self.state_cb_times) - 1) 
+            progress = collections.deque(maxlen=round(self.stalled_time/T))
+        else:
+            self.server.set_aborted()
+            rospy.logerr('Gripper Controller: no messages from joint_states topic received')
+            return
+
+        diff_at_start = round(abs(goal.command.position - self.current_position), 3)
+
+        # keep watching for gripper position...
         while True:
             if self.server.is_preempt_requested():
-                self.server.set_preemtped()
+                self.server.set_preempted()
                 rospy.loginfo('Gripper Controller: Preempted.')
                 return
-            # TODO: get joint position, break when we have reached goal
-            break
-        self.server.set_succeeded()
+
+            # synchronize with the joints state callbacks;
+            self.state_cb_event.wait()
+
+            # break when we have reached the goal position...
+            diff = abs(goal.command.position - self.current_position)
+            if diff < self._EPSILON_OPENING_DIFF_:
+                result.reached_goal = True
+                break
+            
+            # ...or when progress stagnates, probably signaling that the gripper is exerting max effort and not moving
+            progress.append(round(diff, 3))  # round to millimeter to neglect tiny motions of the stalled gripper
+            if len(progress) == progress.maxlen and progress.count(progress[0]) == len(progress):
+                if progress[0] == diff_at_start:
+                    # we didn't move at all! is the gripper connected?
+                    self.server.set_aborted()
+                    rospy.logerr('Gripper Controller: gripper not moving; is the servo connected?')
+                    return
+
+                # buffer full with all-equal positions -> gripper stalled
+                result.stalled = True
+                break
+            
+            # publish feedback
+            feedback.position = self.current_position
+            self.server.publish_feedback(feedback)
+
+        result.position = self.current_position
+        self.server.set_succeeded(result)
         rospy.loginfo('Gripper Controller: Succeeded.')
 
-    def stateCb(self, msg):
-        self.state = msg
+
+    def stateCb(self, joint_states):
+        try:
+            index = joint_states.name.index(self.model.joint)
+            angle = joint_states.position[index]
+        except ValueError:
+            # no problem; probably a joint states message unrelated to the gripper
+            return
+        
+        self.current_position = self.model.getPosition(angle)
+        
+        # notice the action server goal callback that new data is available
+        self.state_cb_event.set()
+        self.state_cb_event.clear()
+        
+        self.state_cb_times.append(rospy.get_rostime().to_sec())
+
 
 if __name__=='__main__':
     try:
@@ -209,4 +299,3 @@ if __name__=='__main__':
         GripperActionController()
     except rospy.ROSInterruptException:
         rospy.loginfo('Hasta la Vista...')
-
