@@ -28,6 +28,9 @@
 
 ## @file controllers.py Base class and support functions for a controllers.
 
+from diagnostic_msgs.msg import *
+
+
 ## @brief Controllers interact with ArbotiX hardware.
 class Controller:
 
