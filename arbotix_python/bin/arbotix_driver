@@ -143,9 +143,10 @@ class ArbotixROS(ArbotiX):
                 # update io
                 for io in self.io.values():
                     io.update()
-    
+
                 # publish feedback
-                self.joint_state_publisher.update(self.joints.values(), self.controllers)
+                joints_to_publish = [j for j in self.joints.values() if j.publish_joint_state]
+                self.joint_state_publisher.update(joints_to_publish, self.controllers)
                 self.diagnostics.update(self.joints.values(), self.controllers)
             except ArbotiXException as e:
                 # We assume this is a serial connection error (as is the only use of

@@ -62,6 +62,8 @@ class DynamixelServo(Joint):
         self.invert = rospy.get_param(n+"invert",False)
         self.readable = rospy.get_param(n+"readable",True)
 
+        self.publish_joint_state = rospy.get_param(n + "publish_joint_state", True)
+
         self.status = "OK"
         self.level = DiagnosticStatus.OK
 
