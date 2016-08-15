@@ -38,11 +38,13 @@ from arbotix_python.diff_controller import DiffController
 from arbotix_python.follow_controller import FollowController
 from arbotix_python.servo_controller import *
 from arbotix_python.linear_controller import *
+from arbotix_python.gripper_controller import *
 from arbotix_python.publishers import *
 from arbotix_python.io import *
 
 # name: [ControllerClass, pause]
 controller_types = { "follow_controller" : FollowController,
+                     "gripper_controller": GripperController,
                      "diff_controller"   : DiffController,
 #                    "omni_controller"   : OmniController,
                      "linear_controller" : LinearControllerAbsolute,
