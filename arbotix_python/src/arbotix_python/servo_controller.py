@@ -375,10 +375,10 @@ class ServoController(Controller):
             elif isinstance(joint, HobbyServo):
                 self.hobbyservos.append(joint)
 
-        self.w_delta = rospy.Duration(1.0/rospy.get_param("~write_rate", 10.0))
+        self.w_delta = rospy.Duration(1.0/rospy.get_param("~write_rate", 100.0))
         self.w_next = rospy.Time.now() + self.w_delta
 
-        self.r_delta = rospy.Duration(1.0/rospy.get_param("~read_rate", 10.0))
+        self.r_delta = rospy.Duration(1.0/rospy.get_param("~read_rate", 100.0))
         self.r_next = rospy.Time.now() + self.r_delta
 
         rospy.Service(name + '/relax_all', Relax, self.relaxCb)
